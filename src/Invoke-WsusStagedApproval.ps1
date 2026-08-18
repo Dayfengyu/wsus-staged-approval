@@ -11,6 +11,7 @@ param(
 # 1. 美國每月第二個星期二的隔天（台灣 Patch Wednesday）之後，才偵測新更新。
 # 2. 沿用 WSUS 既有下載設定，不建立群組，也不做任何預先核准。
 # 3. 所有目標更新都成為 Ready 後，才把當天記為 D0 並開始分批派送。
+# 4. Windows 11 依 D0～D10 分批；Windows Server 於 D10 派送。
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
@@ -21,15 +22,30 @@ $UseSsl          = $false
 $WsusPort        = 8530
 $LogPath         = "C:\ProgramData\WsusStagedApproval\wsus.log"
 $StatePath       = "C:\ProgramData\WsusStagedApproval\wsus-cycle-state.json"
+$DeadlineTimeZoneId = "Taipei Standard Time"
+
+try {
+    $DeadlineTimeZone = [System.TimeZoneInfo]::FindSystemTimeZoneById($DeadlineTimeZoneId)
+}
+catch {
+    throw "無法載入 Deadline 時區 $DeadlineTimeZoneId：$($_.Exception.Message)"
+}
 
 # 目標產品關鍵字：同時比對 WSUS 產品名稱與更新標題，不分大小寫。
-# 可依環境增加或刪除，例如：Windows 10、Windows Server 2022、Microsoft 365 Apps。
+# Office 2016 已從自動核准範圍移除。
+$ClientProductKeywords = @(
+    "Windows 11"
+)
+
+$ServerProductKeywords = @(
+    "Microsoft Server operating system-21H2",
+    "Windows Server 2016",
+    "Windows Server 2019"
+)
+
 $TargetProductKeywords = @(
-    "Windows 11",
-    "Office 2016",
-    "Excel 2016",
-    "Word 2016",
-    "PowerPoint 2016"
+    $ClientProductKeywords
+    $ServerProductKeywords
 )
 
 $TargetProductKeywords = @(
@@ -60,6 +76,25 @@ function Write-Log {
     Write-Host $line
 }
 
+function Write-LogSection {
+    param([Parameter(Mandatory = $true)][string]$Title)
+
+    $separator = "=" * 72
+
+    Add-Content -LiteralPath $LogPath -Value ""
+    Add-Content -LiteralPath $LogPath -Value $separator
+    Write-Host ""
+    Write-Host $separator
+
+    Write-Log "【$Title】"
+
+    Add-Content -LiteralPath $LogPath -Value $separator
+    Write-Host $separator
+}
+
+Write-LogSection -Title "開始執行 WSUS 自動分批核准作業"
+Write-Log "Deadline 時區：$DeadlineTimeZoneId（UTC+08:00）"
+
 # ===== WSUS API 與連線 =====
 try {
     Add-Type -Path "C:\Program Files\Update Services\API\Microsoft.UpdateServices.Administration.dll"
@@ -70,7 +105,11 @@ try {
         $WsusPort
     )
 
+    $serverConfiguration = $wsus.GetConfiguration()
+    $currentWsusServerId = $serverConfiguration.ServerId.ToString()
+
     Write-Log "WSUS 連線成功：$($wsus.Name)"
+    Write-Log "WSUS 伺服器識別碼：$currentWsusServerId"
 }
 catch {
     Write-Log "WSUS 連線失敗：$($_.Exception.Message)"
@@ -94,11 +133,13 @@ function Get-PatchWednesday {
 function New-CycleState {
     param(
         [Parameter(Mandatory = $true)][string]$CycleMonth,
-        [Parameter(Mandatory = $true)][datetime]$PatchDay
+        [Parameter(Mandatory = $true)][datetime]$PatchDay,
+        [Parameter(Mandatory = $true)][string]$WsusServerId
     )
 
     return [pscustomobject][ordered]@{
-        SchemaVersion  = 3
+        SchemaVersion  = 5
+        WsusServerId   = $WsusServerId
         CycleMonth     = $CycleMonth
         PatchDay       = $PatchDay.ToString("yyyy-MM-dd")
         Status         = "WaitingForUpdate"
@@ -137,15 +178,16 @@ function Read-CycleState {
 # =========================
 # 更新篩選與 WSUS 輔助函式
 # =========================
-function Test-IsTargetUpdate {
-    param([Parameter(Mandatory = $true)]$Update)
+function Test-UpdateMatchesKeywords {
+    param(
+        [Parameter(Mandatory = $true)]$Update,
+        [Parameter(Mandatory = $true)][string[]]$Keywords
+    )
 
     $title = [string]$Update.Title
     $productText = (@($Update.ProductTitles) -join " | ")
 
-    $matchesTargetProduct = $false
-
-    foreach ($keyword in $TargetProductKeywords) {
+    foreach ($keyword in $Keywords) {
         $matchesProductName = $productText.IndexOf(
             $keyword,
             [System.StringComparison]::OrdinalIgnoreCase
@@ -157,10 +199,17 @@ function Test-IsTargetUpdate {
         ) -ge 0
 
         if ($matchesProductName -or $matchesTitle) {
-            $matchesTargetProduct = $true
-            break
+            return $true
         }
     }
+
+    return $false
+}
+
+function Test-IsTargetUpdate {
+    param([Parameter(Mandatory = $true)]$Update)
+
+    $matchesTargetProduct = Test-UpdateMatchesKeywords -Update $Update -Keywords $TargetProductKeywords
 
     return (
         !$Update.IsDeclined -and
@@ -180,6 +229,11 @@ function Get-NewTargetUpdates {
     $scope.FromArrivalDate = $FromDate
     $scope.ToArrivalDate = Get-Date
 
+    # WSUS 重裝後，舊更新的 ArrivalDate 可能會變成重新同步的日期。
+    # 再限制為 Patch Wednesday 前 7 天以後建立的更新，避免誤抓大量歷史更新。
+    $scope.FromCreationDate = $FromDate.AddDays(-7)
+    $scope.ToCreationDate = Get-Date
+
     $allNewUpdates = @($Server.GetUpdates($scope))
     $targetUpdates = @($allNewUpdates | Where-Object { Test-IsTargetUpdate -Update $_ })
     return @($targetUpdates | Sort-Object ArrivalDate)
@@ -192,6 +246,7 @@ function Get-UpdatesFromState {
     )
 
     $result = @()
+    $missingIds = @()
 
     foreach ($updateIdText in @($UpdateIds)) {
         try {
@@ -199,18 +254,25 @@ function Get-UpdatesFromState {
             $revisionId = New-Object -TypeName Microsoft.UpdateServices.Administration.UpdateRevisionId -ArgumentList ([guid]$updateIdText), 0
             $result += $Server.GetUpdate($revisionId)
         }
+        catch [Microsoft.UpdateServices.Administration.WsusObjectNotFoundException] {
+            $missingIds += [string]$updateIdText
+        }
         catch {
             throw "無法從 WSUS 取得更新 $updateIdText：$($_.Exception.Message)"
         }
     }
 
-    return @($result)
+    return [pscustomobject]@{
+        Updates    = @($result)
+        MissingIds = @($missingIds)
+    }
 }
 
 function Ensure-InstallApproval {
     param(
         [Parameter(Mandatory = $true)]$Update,
-        [Parameter(Mandatory = $true)]$Group
+        [Parameter(Mandatory = $true)]$Group,
+        [Parameter(Mandatory = $true)][datetime]$DeadlineUtc
     )
 
     $installAction = [Microsoft.UpdateServices.Administration.UpdateApprovalAction]::Install
@@ -220,27 +282,36 @@ function Ensure-InstallApproval {
     ) | Select-Object -First 1
 
     if ($existingApproval) {
-        return $false
+        # 只要該更新對群組已有 Install 核准，保留原核准與原 Deadline。
+        return "AlreadyApproved"
     }
 
-    [void]$Update.Approve($installAction, $Group)
-    return $true
+    [void]$Update.Approve($installAction, $Group, $DeadlineUtc)
+    return "Created"
 }
 
 # =========================
-# 群組定義（範例名稱，請改成自己的既有 WSUS 群組）
+# 群組定義（公開範例名稱，請改成自己的既有 WSUS 群組）
 # =========================
 $deptTable = @(
-    @{ Name = "IT-Pilot";         Day = 0 },
-    @{ Name = "Department-A";     Day = 1 },
-    @{ Name = "Branch-01";        Day = 2 },
-    @{ Name = "Branch-02";        Day = 3 },
-    @{ Name = "Branch-03";        Day = 4 },
-    @{ Name = "Branch-04";        Day = 5 },
-    @{ Name = "Branch-05";        Day = 6 },
-    @{ Name = "Site-01";          Day = 7 },
-    @{ Name = "Site-02";          Day = 8 },
-    @{ Name = "Remote-Site";      Day = 9 }
+    # Windows 11：D0～D10，各組 Deadline 為當日 12:15。
+    @{ Name = "IT-Pilot";            Day = 0;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Headquarters-A";      Day = 1;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Headquarters-B";      Day = 1;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Branch-01";           Day = 2;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Branch-02";           Day = 3;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Branch-03";           Day = 4;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Branch-04";           Day = 5;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Branch-05";           Day = 6;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Site-01";             Day = 7;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Site-02";             Day = 8;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Remote-Site";         Day = 9;  Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Unassigned Computers"; Day = 10; Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+    @{ Name = "Client-Fallback";     Day = 10; Scope = "Client"; DeadlineHour = 12; DeadlineMinute = 15 },
+
+    # Windows Server：D10，Deadline 為台灣時間下午 17:30。
+    @{ Name = "Server-Pilot";        Day = 10; Scope = "Server"; DeadlineHour = 17; DeadlineMinute = 30 },
+    @{ Name = "Server-Production";   Day = 10; Scope = "Server"; DeadlineHour = 17; DeadlineMinute = 30 }
 )
 
 # =========================
@@ -271,16 +342,32 @@ catch {
 }
 
 $stateSchemaVersion = $null
+$stateWsusServerId = $null
 if ($cycleState -and $cycleState.PSObject.Properties["SchemaVersion"]) {
     $stateSchemaVersion = $cycleState.SchemaVersion
 }
+if ($cycleState -and $cycleState.PSObject.Properties["WsusServerId"]) {
+    $stateWsusServerId = [string]$cycleState.WsusServerId
+}
 
-if (
-    -not $cycleState -or
-    $stateSchemaVersion -ne 3 -or
-    $cycleState.CycleMonth -ne $cycleMonth
-) {
-    $cycleState = New-CycleState -CycleMonth $cycleMonth -PatchDay $patchDay
+$resetReason = $null
+
+if (-not $cycleState) {
+    $resetReason = "找不到既有週期狀態"
+}
+elseif ($stateSchemaVersion -ne 5) {
+    $resetReason = "狀態檔版本已更新"
+}
+elseif ($stateWsusServerId -ne $currentWsusServerId) {
+    $resetReason = "偵測到 WSUS 已重裝或更換 SUSDB"
+}
+elseif ($cycleState.CycleMonth -ne $cycleMonth) {
+    $resetReason = "進入新的月份"
+}
+
+if ($resetReason) {
+    Write-Log "$resetReason，將重建 $cycleMonth 的週期狀態"
+    $cycleState = New-CycleState -CycleMonth $cycleMonth -PatchDay $patchDay -WsusServerId $currentWsusServerId
     Save-CycleState -State $cycleState
 }
 
@@ -292,9 +379,53 @@ if ($cycleState.Status -eq "Completed") {
 # ===== 取得現有 WSUS 群組；本腳本不建立或修改群組結構 =====
 $allGroups = @($wsus.GetComputerTargetGroups())
 
+# WSUS 自動核准規則可與腳本並存；已有核准會保留並略過。
+$enabledAutomaticRules = @()
+try {
+    $enabledAutomaticRules = @($wsus.GetInstallApprovalRules() | Where-Object { $_.Enabled })
+}
+catch {
+    Write-Log "警告：檢查 WSUS 自動核准規則失敗，但不影響本次執行：$($_.Exception.Message)"
+}
+
+if ($enabledAutomaticRules.Count -gt 0) {
+    Write-Log "偵測到 $($enabledAutomaticRules.Count) 條已啟用的 WSUS 自動核准規則；已有核准將直接略過，腳本繼續執行"
+    foreach ($rule in $enabledAutomaticRules) {
+        Write-Log "已啟用規則：$($rule.Name)"
+    }
+}
+
+Write-LogSection -Title "檢查新更新與下載狀態"
+
 # =========================
 # 等待新更新與下載完成閘門
 # =========================
+$updates = @()
+
+# 先檢查狀態檔記錄的 UpdateId 是否仍存在於當前 SUSDB。
+# 即使 ServerId 因還原或複製而沒有變更，仍可自動排除失效狀態。
+if ($cycleState.Status -eq "Dispatching") {
+    try {
+        $stateLookup = Get-UpdatesFromState -Server $wsus -UpdateIds $cycleState.UpdateIds
+    }
+    catch {
+        Write-Log "讀取當月更新清單失敗：$($_.Exception.Message)"
+        exit 1
+    }
+
+    if ($stateLookup.MissingIds.Count -gt 0) {
+        Write-Log "狀態檔有 $($stateLookup.MissingIds.Count) 筆 UpdateId 不存在於當前 SUSDB，判定為 WSUS 重裝後的舊狀態"
+        Write-Log "失效 UpdateId：$($stateLookup.MissingIds -join '、')"
+
+        $cycleState = New-CycleState -CycleMonth $cycleMonth -PatchDay $patchDay -WsusServerId $currentWsusServerId
+        Save-CycleState -State $cycleState
+        Write-Log "已自動清除失效清單，改用當前 WSUS 資料庫重新偵測本月更新"
+    }
+    else {
+        $updates = @($stateLookup.Updates)
+    }
+}
+
 if ($cycleState.Status -ne "Dispatching") {
     try {
         $newUpdates = @(Get-NewTargetUpdates -Server $wsus -FromDate $patchDay)
@@ -322,16 +453,13 @@ if ($cycleState.Status -ne "Dispatching") {
     Save-CycleState -State $cycleState
 
     Write-Log "已偵測到 $($newUpdates.Count) 筆本月目標更新"
+    $clientUpdateCount = (@($newUpdates | Where-Object { Test-UpdateMatchesKeywords -Update $_ -Keywords $ClientProductKeywords })).Count
+    $serverUpdateCount = (@($newUpdates | Where-Object { Test-UpdateMatchesKeywords -Update $_ -Keywords $ServerProductKeywords })).Count
+    Write-Log "目標更新分類：Windows 11=$clientUpdateCount 筆；Windows Server=$serverUpdateCount 筆"
 
     try {
-        $serverConfiguration = $wsus.GetConfiguration()
-
         if ($serverConfiguration.HostBinariesOnMicrosoftUpdate) {
             throw "目前設定為由用戶端直接向 Microsoft Update 下載檔案，WSUS 本機沒有內容檔可供本腳本驗證。"
-        }
-
-        if ($serverConfiguration.DownloadUpdateBinariesAsNeeded) {
-            Write-Log "WSUS 目前設定為核准後才下載；本腳本不會建立暫存群組或預先核准，將等待你既有的 WSUS 設定完成下載"
         }
 
         $downloadProgress = $wsus.GetContentDownloadProgress()
@@ -388,15 +516,6 @@ if ($cycleState.Status -ne "Dispatching") {
     Write-Log "全部 $($newUpdates.Count) 筆目標更新均已下載完成；今天起算為 D0"
     $updates = @($newUpdates)
 }
-else {
-    try {
-        $updates = @(Get-UpdatesFromState -Server $wsus -UpdateIds $cycleState.UpdateIds)
-    }
-    catch {
-        Write-Log "讀取當月更新清單失敗：$($_.Exception.Message)"
-        exit 1
-    }
-}
 
 if ($updates.Count -eq 0) {
     Write-Log "當月派送清單為空，為避免誤核准，腳本停止"
@@ -404,7 +523,7 @@ if ($updates.Count -eq 0) {
 }
 
 # =========================
-# 以實際下載完成日計算 D0～D9
+# 以實際下載完成日計算 D0～D10
 # =========================
 try {
     $cycleStartDate = [datetime]::ParseExact(
@@ -425,12 +544,14 @@ if ($offset -lt 0) {
     exit 1
 }
 
-$dispatchDay = [Math]::Min($offset, 9)
+$maxDispatchDay = [int](($deptTable | Measure-Object -Property Day -Maximum).Maximum)
+$dispatchDay = [Math]::Min($offset, $maxDispatchDay)
 Write-Log "目前實際派送週期：D$dispatchDay（D0：$($cycleStartDate.ToString('yyyy-MM-dd'))）"
 
 # =========================
 # 正式群組核准流程
 # =========================
+Write-LogSection -Title "D$dispatchDay 分批核准作業"
 $approvalErrors = 0
 
 foreach ($dept in $deptTable) {
@@ -454,6 +575,26 @@ foreach ($dept in $deptTable) {
 
     $group = $groupMatches[0]
     $newApprovalCount = 0
+    $existingApprovalCount = 0
+    $matchedUpdateCount = 0
+
+    $deadlineTaipei = $cycleStartDate.AddDays([int]$dept.Day).AddHours([int]$dept.DeadlineHour).AddMinutes([int]$dept.DeadlineMinute)
+    $deadlineTaipeiUnspecified = [datetime]::SpecifyKind($deadlineTaipei, [System.DateTimeKind]::Unspecified)
+    $deadlineUtc = [System.TimeZoneInfo]::ConvertTimeToUtc($deadlineTaipeiUnspecified, $DeadlineTimeZone)
+
+    if ($dept.Scope -eq "Client") {
+        $scopeKeywords = $ClientProductKeywords
+        $scopeName = "Windows 11"
+    }
+    elseif ($dept.Scope -eq "Server") {
+        $scopeKeywords = $ServerProductKeywords
+        $scopeName = "Windows Server"
+    }
+    else {
+        Write-Log "群組 $($dept.Name) 的 Scope 設定無效：$($dept.Scope)"
+        $approvalErrors++
+        continue
+    }
 
     foreach ($update in $updates) {
         try {
@@ -464,10 +605,20 @@ foreach ($dept in $deptTable) {
                 continue
             }
 
-            $created = Ensure-InstallApproval -Update $update -Group $group
-            if ($created) {
+            if (!(Test-UpdateMatchesKeywords -Update $update -Keywords $scopeKeywords)) {
+                continue
+            }
+
+            $matchedUpdateCount++
+            $approvalResult = Ensure-InstallApproval -Update $update -Group $group -DeadlineUtc $deadlineUtc
+
+            if ($approvalResult -eq "Created") {
                 $newApprovalCount++
-                Write-Log "已核准至 $($dept.Name)：$($update.Title)"
+                Write-Log "已核准至 $($dept.Name)：$($update.Title)；Deadline(台灣時間)=$($deadlineTaipei.ToString('yyyy-MM-dd HH:mm'))"
+            }
+            elseif ($approvalResult -eq "AlreadyApproved") {
+                $existingApprovalCount++
+                Write-Log "已有核准，直接略過：群組=$($dept.Name)；更新=$($update.Title)"
             }
         }
         catch {
@@ -476,11 +627,14 @@ foreach ($dept in $deptTable) {
         }
     }
 
-    if ($newApprovalCount -eq 0) {
-        Write-Log "群組 $($dept.Name) 無新增核准（既有核准會保留）"
+    if ($matchedUpdateCount -eq 0) {
+        Write-Log "群組 $($dept.Name) 本月沒有可核准的 $scopeName 目標更新"
+    }
+    elseif ($newApprovalCount -eq 0) {
+        Write-Log "群組 $($dept.Name) 無新增核准，已略過 $existingApprovalCount 筆既有核准"
     }
     else {
-        Write-Log "群組 $($dept.Name) 本次新增 $newApprovalCount 筆核准"
+        Write-Log "群組 $($dept.Name) 本次新增 $newApprovalCount 筆核准，略過 $existingApprovalCount 筆既有核准"
     }
 
     Write-Host ""
@@ -492,11 +646,11 @@ if ($approvalErrors -gt 0) {
     exit 1
 }
 
-if ($offset -ge 9) {
+if ($offset -ge $maxDispatchDay) {
     $cycleState.Status = "Completed"
     $cycleState.CompletedDate = $today.ToString("yyyy-MM-dd")
     Save-CycleState -State $cycleState
-    Write-Log "本月 D0～D9 分批核准作業已全部完成"
+    Write-Log "本月 D0～D$maxDispatchDay 分批核准作業已全部完成"
 }
 else {
     Save-CycleState -State $cycleState
