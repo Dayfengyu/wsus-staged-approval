@@ -1,7 +1,0 @@
-[
-  { "Name": "IT-Pilot", "Day": 0 },
-  { "Name": "Headquarters", "Day": 1 },
-  { "Name": "Branch-East", "Day": 3 },
-  { "Name": "Branch-West", "Day": 5 },
-  { "Name": "Remote-Sites", "Day": 9 }
-]
